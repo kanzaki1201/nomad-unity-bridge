@@ -599,6 +599,15 @@ namespace Malloc.NomadLink
                 return;
             }
 
+            if (header.index_format != "uint32" ||
+                header.position_format != "float32x3")
+            {
+                SetStatus($"Connected. Skipped unsupported mesh delta for {header.mesh_id} " +
+                    $"(index: {header.index_format ?? "absent"}, " +
+                    $"position: {header.position_format ?? "absent"}).");
+                return;
+            }
+
             if (!objects.TryGetValue(header.mesh_id, out var entry))
             {
                 Send(new RequestMeshDto
@@ -921,17 +930,10 @@ namespace Malloc.NomadLink
         private static void ValidateMeshDeltaHeader(MeshDeltaDto header)
         {
             if (header == null || string.IsNullOrEmpty(header.mesh_id) ||
-                header.count < 0 || header.vertex_count < 0 ||
-                header.index_format != "uint32")
+                header.count < 0 || header.vertex_count < 0)
             {
                 throw new InvalidDataException(
                     "The mesh delta header is invalid.");
-            }
-
-            if (header.position_format != "float32x3")
-            {
-                throw new InvalidDataException(
-                    "The mesh delta format is unsupported.");
             }
         }
 

@@ -155,6 +155,84 @@ namespace Malloc.NomadLink.Tests
             }
         }
 
+        [TestCase("paint")]
+        [TestCase("position")]
+        [TestCase("index")]
+        public void UnsupportedDeltaPreservesPreviewAndAcceptsLaterUpdates(string format)
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                SendScene(peer);
+                WaitUntil(() => session.ObjectCount == 3);
+                session.SetMaterial(owner, "mesh-a", materialA);
+                session.SetMaterial(owner, "mesh-i", materialB);
+                var renderer = session.FindRenderer("mesh-a");
+                var instance = session.FindRenderer("mesh-i");
+                var mesh = session.FindMesh("mesh-a");
+                var vertices = mesh.vertices;
+                var triangles = mesh.triangles;
+
+                var json = MeshDeltaJson("mesh-a", true);
+                if (format == "paint")
+                {
+                    json = json.Replace("\"position_offset\":4", "\"color_offset\":4")
+                        .Replace("\"position_format\":\"float32x3\"",
+                            "\"color_format\":\"rgbm8\"")
+                        .Replace("\"binary_size\":16", "\"binary_size\":8");
+                }
+                else
+                {
+                    json = json.Replace(format == "index" ? "uint32" : "float32x3",
+                        "unknown");
+                }
+
+                json = json.Insert(json.Length - 1, ",\"name\":\"Skipped Rename\"");
+                peer.Send(json, format == "paint"
+                    ? DeltaBinary(9f).Take(8).ToArray() : DeltaBinary(9f));
+                WaitUntil(() => session.Status.Contains("unsupported") || !session.IsRunning);
+                Assert.That(session.IsRunning, Is.True);
+                Assert.That(session.ObjectCount, Is.EqualTo(3));
+                Assert.That(session.GetSnapshot(owner).Enabled, Is.True);
+                Assert.That(session.Error, Is.Empty);
+                Assert.That(session.FindRenderer("mesh-a"), Is.SameAs(renderer));
+                Assert.That(session.FindRenderer("mesh-i"), Is.SameAs(instance));
+                Assert.That(session.FindMesh("mesh-a"), Is.SameAs(mesh));
+                Assert.That(session.FindMesh("mesh-i"), Is.SameAs(mesh));
+                Assert.That(mesh.vertices, Is.EqualTo(vertices));
+                Assert.That(mesh.triangles, Is.EqualTo(triangles));
+                Assert.That(renderer.sharedMaterial, Is.SameAs(materialA));
+                Assert.That(instance.sharedMaterial, Is.SameAs(materialB));
+                Assert.That(Row("mesh-a").Name, Is.EqualTo("Duplicate"));
+
+                peer.Send(MeshDeltaJson("mesh-a", true), DeltaBinary(7f));
+                WaitUntil(() => mesh.vertices[1].x == 7f);
+                Assert.That(session.IsRunning, Is.True);
+                Assert.That(renderer.sharedMaterial, Is.SameAs(materialA));
+                peer.Send(ObjectStateJson("mesh-a", "Continued", true, true));
+                WaitUntil(() => Row("mesh-a").Name == "Continued");
+            }
+        }
+
+        [Test]
+        public void MalformedSupportedDeltaStillFailsClose()
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                SendScene(peer);
+                WaitUntil(() => session.ObjectCount == 3);
+                peer.Send(MeshDeltaJson("mesh-a", true)
+                    .Replace("\"position_offset\":4", "\"position_offset\":16"),
+                    DeltaBinary(7f));
+                WaitUntil(() => !session.IsRunning);
+                Assert.That(session.Error, Does.Contain("range exceeds"));
+                Assert.That(session.ObjectCount, Is.Zero);
+            }
+        }
+
         [Test]
         public void DestroyedRendererFailsCloseAndClearsRows()
         {
