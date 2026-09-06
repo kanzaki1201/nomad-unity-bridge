@@ -400,6 +400,151 @@ namespace Malloc.NomadLink.Tests
             return bytes;
         }
 
+        [Test]
+        public void PaintUpdatesPreserveSeamsGeometryAndMaterials()
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                peer.Send(UvMeshJson(), UvMeshBinary());
+                peer.Send(MeshInstanceJson("mesh-i", "geometry-a", "Instance", false));
+                WaitUntil(() => session.ObjectCount == 2);
+                var mesh = session.FindMesh("mesh-a");
+                session.SetMaterial(owner, "mesh-a", materialA);
+                session.SetMaterial(owner, "mesh-i", materialB);
+                var positions = mesh.vertices;
+                var normals = mesh.normals;
+                var tangents = mesh.tangents;
+                var triangles = mesh.triangles;
+                var uv = mesh.uv;
+                var sparse = new byte[] { 0, 0, 0, 0, 255, 128, 0, 128, 64 };
+                peer.Send(PaintJson("mesh_delta", 4, sparse.Length,
+                    "\"count\":1,\"index_offset\":0,\"index_format\":\"uint32\",",
+                    "\"color_offset\":4,\"color_format\":\"rgbm8\",\"opacity_offset\":8,\"opacity_format\":\"uint8_norm\""), sparse);
+                WaitUntil(() => mesh.colors.Length == 5);
+                Assert.That(mesh.colors[0].r, Is.EqualTo(128f / 255f).Within(0.00001f));
+                Assert.That(mesh.colors[0].g, Is.EqualTo(128f * 128f / 65025f).Within(0.00001f));
+                Assert.That(mesh.colors[0].a, Is.EqualTo(64f / 255f).Within(0.00001f));
+                Assert.That(mesh.colors[3], Is.EqualTo(mesh.colors[0]));
+                Assert.That(mesh.colors[1], Is.EqualTo(Color.white));
+                var rgb = mesh.colors[0];
+                peer.Send(PaintJson("mesh_attributes", 4, 4, "",
+                    "\"opacity_offset\":0,\"opacity_format\":\"uint8_norm\""),
+                    new byte[] { 255, 255, 255, 255 });
+                WaitUntil(() => mesh.colors[0].a == 1f);
+                Assert.That(mesh.colors[0].r, Is.EqualTo(rgb.r));
+                Assert.That(mesh.vertices, Is.EqualTo(positions));
+                Assert.That(mesh.normals, Is.EqualTo(normals));
+                Assert.That(mesh.tangents, Is.EqualTo(tangents));
+                Assert.That(mesh.triangles, Is.EqualTo(triangles));
+                Assert.That(mesh.uv, Is.EqualTo(uv));
+                Assert.That(session.FindMesh("mesh-i"), Is.SameAs(mesh));
+                Assert.That(session.FindRenderer("mesh-a").sharedMaterial, Is.SameAs(materialA));
+                Assert.That(session.FindRenderer("mesh-i").sharedMaterial, Is.SameAs(materialB));
+
+                var mixed = DeltaBinary(7f).Concat(new byte[] { 0, 255, 0, 255 }).ToArray();
+                var json = MeshDeltaJson("mesh-a", true).Replace("\"vertex_count\":3", "\"vertex_count\":4")
+                    .Replace("\"binary_size\":16", "\"binary_size\":20");
+                peer.Send(json.Insert(json.Length - 1, ",\"color_offset\":16,\"color_format\":\"rgbm8\""), mixed);
+                WaitUntil(() => mesh.vertices[1].x == 7f);
+                Assert.That(mesh.colors[1], Is.EqualTo(Color.green));
+                Assert.That(mesh.colors[0].r, Is.EqualTo(rgb.r));
+            }
+        }
+
+        [Test]
+        public void FullPaintReplacesAndClearsOptionalChannels()
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                var full = MeshFullJson("mesh-a", "geometry-a", "Paint", false, false);
+                var binary = MeshBinary(1f);
+                var rgb = Enumerable.Repeat(new byte[] { 255, 0, 0, 255 }, 3).SelectMany(x => x).ToArray();
+                var json = full.Replace("\"binary_size\":" + binary.Length,
+                    "\"binary_size\":" + (binary.Length + rgb.Length));
+                peer.Send(json.Insert(json.Length - 1, ",\"color_offset\":" + binary.Length +
+                    ",\"color_format\":\"rgbm8\""), binary.Concat(rgb).ToArray());
+                WaitUntil(() => session.ObjectCount == 1);
+                var mesh = session.FindMesh("mesh-a");
+                Assert.That(mesh.colors, Is.EqualTo(new[] { Color.red, Color.red, Color.red }));
+                var opacityJson = full.Replace("\"binary_size\":" + binary.Length,
+                    "\"binary_size\":" + (binary.Length + 3));
+                peer.Send(opacityJson.Insert(opacityJson.Length - 1, ",\"opacity_offset\":" + binary.Length +
+                    ",\"opacity_format\":\"uint8_norm\""), binary.Concat(new byte[] { 0, 128, 255 }).ToArray());
+                WaitUntil(() => mesh.colors[0].a == 0);
+                Assert.That(mesh.colors[0], Is.EqualTo(new Color(1, 1, 1, 0)));
+                peer.Send(full, binary);
+                WaitUntil(() => mesh.colors.Length == 0);
+            }
+        }
+
+        [TestCase("mesh_delta")]
+        [TestCase("mesh_attributes")]
+        [TestCase("mesh_full")]
+        public void InvalidPaintPreservesWholeUpdateAndLaterRecovery(string type)
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                SendScene(peer);
+                WaitUntil(() => session.ObjectCount == 3);
+                var mesh = session.FindMesh("mesh-a");
+                var positions = mesh.vertices;
+                session.SetMaterial(owner, "mesh-a", materialA);
+                var binary = type == "mesh_full" ? MeshBinary(9f) : DeltaBinary(9f);
+                var json = type == "mesh_full"
+                    ? MeshFullJson("mesh-a", "geometry-a", "Wrong", true, false)
+                    : MeshDeltaJson("mesh-a", true).Replace("mesh_delta", type);
+                json = json.Insert(json.Length - 1,
+                    ",\"color_offset\":9999,\"color_format\":\"rgbm8\"");
+                peer.Send(json, binary);
+                WaitUntil(() => session.Status.Contains("Skipped"));
+                Assert.That(session.IsRunning, Is.True);
+                Assert.That(mesh.vertices, Is.EqualTo(positions));
+                Assert.That(mesh.colors, Is.Empty);
+                Assert.That(Row("mesh-a").Name, Is.EqualTo("Duplicate"));
+                Assert.That(session.FindRenderer("mesh-a").sharedMaterial, Is.SameAs(materialA));
+                peer.Send(MeshDeltaJson("mesh-a", true), DeltaBinary(3f));
+                WaitUntil(() => mesh.vertices[1].x == 3f);
+            }
+        }
+
+        private static string PaintJson(string type, int vertices, int bytes, string indexFields, string channels)
+        {
+            return "{\"type\":\"" + type + "\",\"mesh_id\":\"mesh-a\",\"live_sync\":true," +
+                "\"vertex_count\":" + vertices + ",\"binary_size\":" + bytes + "," + indexFields + channels + "}";
+        }
+
+        [TestCase("\"color_offset\":0")]
+        [TestCase("\"color_format\":\"rgbm8\"")]
+        [TestCase("\"opacity_offset\":0,\"opacity_format\":\"unknown\"")]
+        [TestCase("\"color_offset\":-1,\"color_format\":\"rgbm8\"")]
+        [TestCase("\"color_offset\":9223372036854775807,\"color_format\":\"rgbm8\"")]
+        public void InvalidPaintChannelsRejectAtomically(string channels)
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                SendScene(peer);
+                WaitUntil(() => session.ObjectCount == 3);
+                var mesh = session.FindMesh("mesh-a");
+                peer.Send(PaintJson("mesh_attributes", 3, 12, "", channels), new byte[12]);
+                WaitUntil(() => session.Status.Contains("Skipped"));
+                Assert.That(session.IsRunning, Is.True);
+                Assert.That(mesh.colors, Is.Empty);
+                peer.Send(PaintJson("mesh_attributes", 3, 12, "",
+                    "\"color_offset\":0,\"color_format\":\"rgbm8\""),
+                    Enumerable.Repeat(new byte[] { 0, 255, 0, 255 }, 3).SelectMany(x => x).ToArray());
+                WaitUntil(() => mesh.colors.Length == 3);
+                Assert.That(mesh.colors[0], Is.EqualTo(Color.green));
+            }
+        }
+
         [TestCase("paint")]
         [TestCase("position")]
         [TestCase("index")]
@@ -424,7 +569,7 @@ namespace Malloc.NomadLink.Tests
                 {
                     json = json.Replace("\"position_offset\":4", "\"color_offset\":4")
                         .Replace("\"position_format\":\"float32x3\"",
-                            "\"color_format\":\"rgbm8\"")
+                            "\"color_format\":\"unknown\"")
                         .Replace("\"binary_size\":16", "\"binary_size\":8");
                 }
                 else
@@ -461,7 +606,7 @@ namespace Malloc.NomadLink.Tests
         }
 
         [Test]
-        public void MalformedSupportedDeltaStillFailsClose()
+        public void MalformedSupportedDeltaPreservesPreview()
         {
             using (var peer = new FakePeer())
             {
@@ -472,9 +617,10 @@ namespace Malloc.NomadLink.Tests
                 peer.Send(MeshDeltaJson("mesh-a", true)
                     .Replace("\"position_offset\":4", "\"position_offset\":16"),
                     DeltaBinary(7f));
-                WaitUntil(() => !session.IsRunning);
-                Assert.That(session.Error, Does.Contain("range exceeds"));
-                Assert.That(session.ObjectCount, Is.Zero);
+                WaitUntil(() => session.Status.Contains("Skipped"));
+                Assert.That(session.Status, Does.Contain("range exceeds"));
+                Assert.That(session.IsRunning, Is.True);
+                Assert.That(session.ObjectCount, Is.EqualTo(3));
             }
         }
 
@@ -515,7 +661,8 @@ namespace Malloc.NomadLink.Tests
                 "object_state",
                 "session_config",
                 "mesh_instance",
-                "mesh_delta_receive"
+                "mesh_delta_receive",
+                "mesh_attributes_receive"
             }));
 
             peer.Send("{\"type\":\"pairing_pending\"}");

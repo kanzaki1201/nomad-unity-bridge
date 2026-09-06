@@ -38,7 +38,8 @@ namespace Malloc.NomadLink
             "object_state",
             "session_config",
             "mesh_instance",
-            "mesh_delta_receive"
+            "mesh_delta_receive",
+            "mesh_attributes_receive"
         };
 
         private readonly ConcurrentQueue<WorkerItem> incoming =
@@ -379,6 +380,9 @@ namespace Malloc.NomadLink
                 case "mesh_delta":
                     HandleMeshDelta(json, binary);
                     break;
+                case "mesh_attributes":
+                    HandleMeshAttributes(json, binary);
+                    break;
                 case "mesh_instance":
                     RequireJsonOnly(binary);
                     HandleMeshInstance(json);
@@ -534,6 +538,16 @@ namespace Malloc.NomadLink
                 return;
             }
 
+            try
+            {
+                data.Colors = ReadPaint(json, binary, vertices.Length, null, null);
+            }
+            catch (Exception exception) when (IsInvalidUpdate(exception))
+            {
+                SetStatus("Connected. Skipped paint: " + exception.Message);
+                return;
+            }
+
             ApplyMeshFull(header, json, data);
             Send(new MeshAckDto
             {
@@ -591,43 +605,82 @@ namespace Malloc.NomadLink
         private void HandleMeshDelta(string json, byte[] binary)
         {
             RequireHello();
-            var header = JsonUtility.FromJson<MeshDeltaDto>(json);
-            ValidateMeshDeltaHeader(header);
             if (!CanApplyLiveFrame(json))
             {
                 return;
             }
 
-            if (header.index_format != "uint32" ||
-                header.position_format != "float32x3")
+            try
             {
-                SetStatus($"Connected. Skipped unsupported mesh delta for {header.mesh_id} " +
-                    $"(index: {header.index_format ?? "absent"}, " +
-                    $"position: {header.position_format ?? "absent"}).");
-                return;
+                ApplyMeshDelta(json, binary);
+            }
+            catch (Exception exception) when (IsInvalidUpdate(exception))
+            {
+                SetStatus("Connected. Skipped mesh delta: " + exception.Message);
+            }
+        }
+
+        private void ApplyMeshDelta(string json, byte[] binary)
+        {
+            var header = ReadUpdateHeader(json, true);
+            if (header.index_format != "uint32")
+            {
+                throw new InvalidDataException("The delta index format is unsupported.");
             }
 
-            if (!objects.TryGetValue(header.mesh_id, out var entry))
-            {
-                Send(new RequestMeshDto
-                {
-                    type = "request_mesh",
-                    link_id = header.mesh_id
-                });
-                return;
-            }
-
+            if (!TryGetUpdateObject(header.mesh_id, out var entry)) return;
             var geometry = GetGeometry(entry);
-            var delta = ReadDelta(binary, header, geometry.Data.Positions.Length);
+            var channels = ReadChannels(json);
+            var delta = ReadDelta(binary, header, geometry.Data.Positions.Length,
+                channels.HasPosition);
+            var colors = ReadPaint(json, binary, header.vertex_count,
+                geometry.Data.Colors, delta.Indices);
             ValidateGeometryUsers(entry.GeometryId);
-            ApplyPositionDelta(geometry.Data.Positions, delta.Indices, delta.Positions);
-            UpdateMeshPositions(geometry.Mesh, geometry.Data);
-            if (geometry.Data.Uvs.Length > 0)
+            if (channels.HasPosition)
             {
-                geometry.Mesh.RecalculateTangents();
+                ApplyPositionDelta(geometry.Data.Positions, delta.Indices, delta.Positions);
+                UpdateMeshPositions(geometry.Mesh, geometry.Data);
+                if (geometry.Data.Uvs.Length > 0) geometry.Mesh.RecalculateTangents();
             }
 
+            geometry.Data.Colors = colors;
+            if (channels.HasColor || channels.HasOpacity) WriteColors(geometry.Mesh, geometry.Data);
             ApplyIncomingState(entry, json, header.request_id);
+        }
+
+        private void HandleMeshAttributes(string json, byte[] binary)
+        {
+            RequireHello();
+            if (!CanApplyLiveFrame(json)) return;
+            try
+            {
+                var header = ReadUpdateHeader(json, false);
+                if (!TryGetUpdateObject(header.mesh_id, out var entry)) return;
+                var geometry = GetGeometry(entry);
+                if (header.vertex_count != geometry.Data.Positions.Length)
+                    throw new InvalidDataException("The paint topology does not match.");
+                var colors = ReadPaint(json, binary, header.vertex_count,
+                    geometry.Data.Colors, null);
+                ValidateGeometryUsers(entry.GeometryId);
+                geometry.Data.Colors = colors;
+                WriteColors(geometry.Mesh, geometry.Data);
+            }
+            catch (Exception exception) when (IsInvalidUpdate(exception))
+            {
+                SetStatus("Connected. Skipped mesh attributes: " + exception.Message);
+            }
+        }
+
+        private bool TryGetUpdateObject(string meshId, out ObjectEntry entry)
+        {
+            if (objects.TryGetValue(meshId, out entry)) return true;
+            Send(new RequestMeshDto { type = "request_mesh", link_id = meshId });
+            return false;
+        }
+
+        private static bool IsInvalidUpdate(Exception exception)
+        {
+            return exception is InvalidDataException || exception is OverflowException;
         }
 
         private void HandleObjectState(string json)
@@ -942,6 +995,19 @@ namespace Malloc.NomadLink
             }
         }
 
+        private static MeshDeltaDto ReadUpdateHeader(string json, bool sparse)
+        {
+            var header = new MeshDeltaDto();
+            var alternate = new MeshDeltaDto { count = -1, vertex_count = -1, index_offset = -1 };
+            JsonUtility.FromJsonOverwrite(json, header);
+            JsonUtility.FromJsonOverwrite(json, alternate);
+            ValidateMeshDeltaHeader(header);
+            if (header.vertex_count != alternate.vertex_count ||
+                (sparse && (header.count != alternate.count || header.index_offset != alternate.index_offset)))
+                throw new InvalidDataException("The mesh update header is incomplete.");
+            return header;
+        }
+
         private static Vector3[] ReadVertices(
             byte[] binary,
             long offset,
@@ -1166,7 +1232,8 @@ namespace Malloc.NomadLink
         private static DeltaData ReadDelta(
             byte[] binary,
             MeshDeltaDto header,
-            int currentVertexCount)
+            int currentVertexCount,
+            bool hasPositions)
         {
             if (header.vertex_count != currentVertexCount)
             {
@@ -1175,9 +1242,10 @@ namespace Malloc.NomadLink
             }
 
             ValidateRange(header.index_offset, header.count, 4, binary.Length);
-            ValidateRange(header.position_offset, header.count, 12, binary.Length);
             var indices = new int[header.count];
-            var positions = new Vector3[header.count];
+            var positions = hasPositions
+                ? ReadVertices(binary, header.position_offset, header.count)
+                : Array.Empty<Vector3>();
             for (var item = 0; item < header.count; item++)
             {
                 var indexPosition = checked((int)(
@@ -1191,20 +1259,73 @@ namespace Malloc.NomadLink
                 }
 
                 indices[item] = (int)vertexIndex;
-                var position = checked((int)(
-                    header.position_offset + item * 12L));
-                positions[item] = new Vector3(
-                    ReadSingle(binary, position),
-                    ReadSingle(binary, position + 4),
-                    -ReadSingle(binary, position + 8));
-                if (!IsFinite(positions[item]))
-                {
-                    throw new InvalidDataException(
-                        "A mesh delta position is not finite.");
-                }
             }
 
             return new DeltaData(indices, positions);
+        }
+
+        private static ChannelsDto ReadChannels(string json)
+        {
+            var first = new ChannelsDto();
+            var second = new ChannelsDto
+            {
+                position_offset = -1, color_offset = -1, opacity_offset = -1,
+                position_format = "absent", color_format = "absent", opacity_format = "absent"
+            };
+            JsonUtility.FromJsonOverwrite(json, first);
+            JsonUtility.FromJsonOverwrite(json, second);
+            first.HasPosition = ValidateChannel(first.position_offset == second.position_offset,
+                first.position_format == second.position_format, first.position_format, "float32x3");
+            first.HasColor = ValidateChannel(first.color_offset == second.color_offset,
+                first.color_format == second.color_format, first.color_format, "rgbm8");
+            first.HasOpacity = ValidateChannel(first.opacity_offset == second.opacity_offset,
+                first.opacity_format == second.opacity_format, first.opacity_format, "uint8_norm");
+            return first;
+        }
+
+        private static bool ValidateChannel(bool offsetPresent, bool formatPresent,
+            string format, string supported)
+        {
+            if (offsetPresent != formatPresent || (formatPresent && format != supported))
+                throw new InvalidDataException("A channel is incomplete or its format is unsupported.");
+            return offsetPresent;
+        }
+
+        private static Color[] ReadPaint(string json, byte[] binary, int vertexCount,
+            Color[] current, int[] indices)
+        {
+            var channels = ReadChannels(json);
+            if (!channels.HasColor && !channels.HasOpacity)
+                return current ?? Array.Empty<Color>();
+            var count = indices?.Length ?? vertexCount;
+            if (channels.HasColor) ValidateRange(channels.color_offset, count, 4, binary.Length);
+            if (channels.HasOpacity) ValidateRange(channels.opacity_offset, count, 1, binary.Length);
+            var colors = current != null && current.Length == vertexCount
+                ? (Color[])current.Clone()
+                : Enumerable.Repeat(Color.white, vertexCount).ToArray();
+            for (var index = 0; index < count; index++)
+            {
+                var source = indices == null ? index : indices[index];
+                var color = colors[source];
+                if (channels.HasColor)
+                {
+                    var offset = checked((int)(channels.color_offset + index * 4L));
+                    var multiplier = binary[offset + 3] / 65025f;
+                    color.r = binary[offset] * multiplier;
+                    color.g = binary[offset + 1] * multiplier;
+                    color.b = binary[offset + 2] * multiplier;
+                }
+                if (channels.HasOpacity)
+                    color.a = binary[checked((int)(channels.opacity_offset + index))] / 255f;
+                colors[source] = color;
+            }
+            return colors;
+        }
+
+        private static void WriteColors(Mesh mesh, MeshData data)
+        {
+            mesh.colors = data.Colors.Length == 0 ? Array.Empty<Color>()
+                : data.Sources.Select(source => data.Colors[source]).ToArray();
         }
 
         private static void UpdateMeshPositions(Mesh mesh, MeshData data)
@@ -1279,6 +1400,7 @@ namespace Malloc.NomadLink
             UpdateMeshPositions(mesh, data);
             mesh.triangles = data.Triangles;
             mesh.uv = data.Uvs;
+            WriteColors(mesh, data);
             if (data.Uvs.Length > 0)
             {
                 mesh.RecalculateTangents();
@@ -2142,6 +2264,7 @@ namespace Malloc.NomadLink
             internal int[] Triangles { get; }
             internal int[] Sources { get; }
             internal Vector2[] Uvs { get; }
+            internal Color[] Colors { get; set; } = Array.Empty<Color>();
         }
 
         private readonly struct DeltaData
@@ -2342,6 +2465,20 @@ namespace Malloc.NomadLink
             public long texcoord_offset;
             public string texcoord_format;
             public long face_uv_offset;
+        }
+
+        [Serializable]
+        private sealed class ChannelsDto
+        {
+            public long position_offset;
+            public string position_format;
+            public long color_offset;
+            public string color_format;
+            public long opacity_offset;
+            public string opacity_format;
+            internal bool HasPosition;
+            internal bool HasColor;
+            internal bool HasOpacity;
         }
 
         [Serializable]
