@@ -3,6 +3,8 @@
 Live, one-way scene preview from Nomad to the Unity Editor through [Nomad App Linking](https://github.com/stephomi/nomad-link).
 Sync multiple objects and assign Unity materials for previz.
 
+[Watch the Nomad Sculpt to Unity demo](Documentation~/nomad-unity-bridge.mp4).
+
 ## Requirements
 
 - Unity 6000.3 or later.
