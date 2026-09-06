@@ -29,6 +29,7 @@ https://github.com/kanzaki1201/nomad-unity-bridge.git
 ## Preview materials
 
 - Each synced object has one material field.
+- Mesh UV coordinates are preserved for textured Unity materials.
 - You can assign, replace, or clear it independently, including on objects that share geometry.
 - Mesh updates, transforms, visibility changes, and renames preserve the assignment during the session.
 - Preview objects and their material assignments last only for the active session.

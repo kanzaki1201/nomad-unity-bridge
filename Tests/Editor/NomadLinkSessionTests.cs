@@ -155,6 +155,202 @@ namespace Malloc.NomadLink.Tests
             }
         }
 
+        [Test]
+        public void UvSeamsSurviveDeltasInstancesAndFullReplacement()
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                peer.Send(UvMeshJson(), UvMeshBinary());
+                peer.Send(MeshInstanceJson("mesh-i", "geometry-a", "Instance", false));
+                WaitUntil(() => session.ObjectCount == 2);
+                var mesh = session.FindMesh("mesh-a");
+                var renderer = session.FindRenderer("mesh-a");
+                session.SetMaterial(owner, "mesh-a", materialA);
+                session.SetMaterial(owner, "mesh-i", materialB);
+                Assert.That(mesh.vertexCount, Is.EqualTo(5));
+                Assert.That(mesh.triangles, Is.EqualTo(new[] { 0, 2, 1, 3, 4, 2 }));
+                Assert.That(mesh.uv[0], Is.EqualTo(new Vector2(0.2f, 0.75f)));
+                Assert.That(mesh.uv[3], Is.EqualTo(new Vector2(1.2f, -0.25f)));
+                Assert.That(mesh.normals[0], Is.EqualTo(mesh.normals[3]));
+                Assert.That(Vector3.Distance(mesh.normals[0], new Vector3(1f, 0f, -1f).normalized), Is.LessThan(0.0001f));
+                var uv = mesh.uv;
+                peer.Send(MeshDeltaJson("mesh-a", true)
+                    .Replace("float32x3", "unsupported"), DeltaBinary(99f));
+                WaitUntil(() => session.Status.Contains("Skipped"));
+                Assert.That(mesh.uv, Is.EqualTo(uv));
+                Assert.That(mesh.vertices[0].x, Is.Zero);
+                var delta = DeltaBinary(7f);
+                BinaryPrimitives.WriteUInt32LittleEndian(delta.AsSpan(0, 4), 0);
+                peer.Send(MeshDeltaJson("mesh-a", true).Replace("\"vertex_count\":3", "\"vertex_count\":4"), delta);
+                WaitUntil(() => !session.IsRunning || mesh.vertices[0].x == 7f);
+                Assert.That(session.IsRunning, Is.True);
+                Assert.That(mesh.vertices[3].x, Is.EqualTo(7f));
+                Assert.That(mesh.normals[0], Is.EqualTo(mesh.normals[3]));
+                Assert.That(mesh.uv, Is.EqualTo(uv));
+                Assert.That(session.FindMesh("mesh-i"), Is.SameAs(mesh));
+                peer.Send(UvMeshJson(), UvMeshBinary(0.4f));
+                WaitUntil(() => mesh.uv[0].x == 0.4f);
+                peer.Send(MeshFullJson("mesh-a", "geometry-a", "Cleared", false, false), MeshBinary(1f));
+                WaitUntil(() => mesh.uv.Length == 0);
+                Assert.That(session.FindMesh("mesh-a"), Is.SameAs(mesh));
+                Assert.That(session.FindRenderer("mesh-a"), Is.SameAs(renderer));
+                Assert.That(renderer.sharedMaterial, Is.SameAs(materialA));
+                Assert.That(session.FindRenderer("mesh-i").sharedMaterial, Is.SameAs(materialB));
+            }
+        }
+
+        private static string UvMeshJson()
+        {
+            return MeshFullJson("mesh-a", "geometry-a", "UV", false, false)
+                .Replace("\"vertex_count\":3", "\"vertex_count\":4")
+                .Replace("\"face_count\":1", "\"face_count\":2")
+                .Replace("\"face_offset\":36", "\"face_offset\":48")
+                .Replace("\"binary_size\":52", "\"binary_size\":152")
+                .TrimEnd('}') + ",\"texcoord_count\":5,\"texcoord_offset\":80," +
+                "\"texcoord_format\":\"float32x2\",\"face_uv_offset\":120}";
+        }
+
+        [TestCase("missing-count")]
+        [TestCase("missing-offset")]
+        [TestCase("missing-format")]
+        [TestCase("missing-faces")]
+        [TestCase("range")]
+        [TestCase("negative-index")]
+        [TestCase("large-index")]
+        [TestCase("nonfinite")]
+        [TestCase("zero-count")]
+        public void MalformedUvDataFailsClose(string kind)
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                var json = UvMeshJson();
+                var binary = UvMeshBinary();
+                switch (kind)
+                {
+                    case "missing-count": json = json.Replace("\"texcoord_count\":5,", ""); break;
+                    case "missing-offset": json = json.Replace("\"texcoord_offset\":80,", ""); break;
+                    case "missing-format": json = json.Replace("\"texcoord_format\":\"float32x2\",", ""); break;
+                    case "missing-faces": json = json.Replace(",\"face_uv_offset\":120", ""); break;
+                    case "range": json = json.Replace("\"texcoord_offset\":80", "\"texcoord_offset\":150"); break;
+                    case "zero-count": json = json.Replace("\"texcoord_count\":5", "\"texcoord_count\":0"); break;
+                    case "nonfinite": WriteSingle(binary, 80, float.NaN); break;
+                    case "negative-index": BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(120, 4), -1); break;
+                    case "large-index": BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(120, 4), 5); break;
+                }
+
+                peer.Send(json, binary);
+                WaitUntil(() => !session.IsRunning);
+                Assert.That(session.Status, Is.EqualTo("Error"));
+            }
+        }
+
+        [Test]
+        public void ExpandedUvVertexCountSelectsUInt32Indices()
+        {
+            const int faceCount = 21846;
+            const int uvCount = faceCount * 3;
+            const int uvOffset = 36 + faceCount * 16;
+            const int faceUvOffset = uvOffset + uvCount * 8;
+            var binary = new byte[faceUvOffset + faceCount * 16];
+            Array.Copy(MeshBinary(1f), binary, 36);
+            for (var face = 0; face < faceCount; face++)
+            {
+                for (var corner = 0; corner < 4; corner++)
+                {
+                    var offset = face * 16 + corner * 4;
+                    var vertex = corner == 3 ? -1 : corner;
+                    var uv = corner == 3 ? -1 : face * 3 + corner;
+                    BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(36 + offset, 4), vertex);
+                    BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(faceUvOffset + offset, 4), uv);
+                }
+            }
+
+            var json = MeshFullJson("mesh-a", "geometry-a", "Expanded", false, false)
+                .Replace("\"face_count\":1", "\"face_count\":" + faceCount)
+                .Replace("\"binary_size\":52", "\"binary_size\":" + binary.Length)
+                .TrimEnd('}') + $",\"texcoord_count\":{uvCount},\"texcoord_offset\":{uvOffset}," +
+                $"\"texcoord_format\":\"float32x2\",\"face_uv_offset\":{faceUvOffset}}}";
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                peer.Send(json, binary);
+                WaitUntil(() => session.ObjectCount == 1);
+                var mesh = session.FindMesh("mesh-a");
+                Assert.That(mesh.vertexCount, Is.EqualTo(uvCount));
+                Assert.That(mesh.indexFormat, Is.EqualTo(UnityEngine.Rendering.IndexFormat.UInt32));
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void UvReplacementRequiresTopologyPermission(bool remove)
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                peer.Send(UvMeshJson(), UvMeshBinary());
+                WaitUntil(() => session.ObjectCount == 1);
+                var json = UvMeshJson();
+                if (remove)
+                {
+                    json = json.Substring(0, json.IndexOf(",\"texcoord_count\"", StringComparison.Ordinal)) + "}";
+                }
+
+                peer.Send(json.Replace("\"replace_topology\":true", "\"replace_topology\":false"), UvMeshBinary(0.5f));
+                WaitUntil(() => !session.IsRunning);
+                Assert.That(session.Error, Does.Contain("topology"));
+            }
+        }
+
+        [Test]
+        public void QuadUvsFollowCornersWithZeroOffset()
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                var binary = UvMeshBinary();
+                BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(60, 4), 3);
+                BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(132, 4), 3);
+                var json = UvMeshJson().Replace("\"face_count\":2", "\"face_count\":1")
+                    .Replace("\"texcoord_offset\":80", "\"texcoord_offset\":0");
+                peer.Send(json, binary);
+                WaitUntil(() => session.ObjectCount == 1);
+                var mesh = session.FindMesh("mesh-a");
+                Assert.That(mesh.triangles, Is.EqualTo(new[] { 0, 2, 1, 0, 3, 2 }));
+                Assert.That(mesh.uv.Length, Is.EqualTo(4));
+                Assert.That(mesh.uv[0], Is.EqualTo(new Vector2(0f, 1f)));
+            }
+        }
+
+        private static byte[] UvMeshBinary(float u = 0.2f)
+        {
+            var bytes = new byte[152];
+            WriteVector(bytes, 0, 0f, 0f, 0f);
+            WriteVector(bytes, 12, 1f, 0f, 0f);
+            WriteVector(bytes, 24, 0f, 1f, 0f);
+            WriteVector(bytes, 36, 0f, 0f, 1f);
+            var faces = new[] { 0, 1, 2, -1, 0, 2, 3, -1 };
+            var faceUvs = new[] { 0, 1, 2, 12345, 3, 2, 4, -1 };
+            for (var index = 0; index < faces.Length; index++)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(48 + index * 4, 4), faces[index]);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(120 + index * 4, 4), faceUvs[index]);
+            }
+
+            WriteSingle(bytes, 80, u);
+            WriteSingle(bytes, 84, 0.25f);
+            WriteSingle(bytes, 104, 1.2f);
+            WriteSingle(bytes, 108, 1.25f);
+            return bytes;
+        }
+
         [TestCase("paint")]
         [TestCase("position")]
         [TestCase("index")]

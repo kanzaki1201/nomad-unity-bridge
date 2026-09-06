@@ -525,16 +525,16 @@ namespace Malloc.NomadLink
             ValidateMeshFullHeader(json, header);
             var vertices = ReadVertices(
                 binary, header.position_offset, header.vertex_count);
-            var triangles = ReadFaces(
-                binary, header.face_offset, header.face_count,
-                header.vertex_count);
+            var faces = ReadFaces(
+                binary, header.face_offset, header.face_count);
+            var data = ReadMeshData(json, binary, vertices, faces);
 
             if (!CanApplyLiveFrame(json))
             {
                 return;
             }
 
-            ApplyMeshFull(header, json, vertices, triangles);
+            ApplyMeshFull(header, json, data);
             Send(new MeshAckDto
             {
                 type = "mesh_ack",
@@ -546,14 +546,13 @@ namespace Malloc.NomadLink
         private void ApplyMeshFull(
             MeshFullDto header,
             string json,
-            Vector3[] vertices,
-            int[] triangles)
+            MeshData data)
         {
             var geometry = GetOrCreateGeometry(header.geometry_id);
             ValidateTopologyReplacement(
-                geometry.Mesh, header.replace_topology,
-                vertices.Length, triangles);
-            WriteMesh(geometry.Mesh, vertices, triangles);
+                geometry.Data, header.replace_topology, data);
+            WriteMesh(geometry.Mesh, data);
+            geometry.Data = data;
 
             var entry = GetOrCreateObject(header.mesh_id);
             AttachGeometry(entry, geometry);
@@ -619,9 +618,10 @@ namespace Malloc.NomadLink
             }
 
             var geometry = GetGeometry(entry);
-            var delta = ReadDelta(binary, header, geometry.Mesh.vertexCount);
+            var delta = ReadDelta(binary, header, geometry.Data.Positions.Length);
             ValidateGeometryUsers(entry.GeometryId);
-            ApplyPositionDelta(geometry.Mesh, delta.Indices, delta.Positions);
+            ApplyPositionDelta(geometry.Data.Positions, delta.Indices, delta.Positions);
+            UpdateMeshPositions(geometry.Mesh, geometry.Data);
             ApplyIncomingState(entry, json, header.request_id);
         }
 
@@ -966,8 +966,7 @@ namespace Malloc.NomadLink
         private static int[] ReadFaces(
             byte[] binary,
             long offset,
-            int count,
-            int vertexCount)
+            int count)
         {
             ValidateRange(offset, count, 16, binary.Length);
             var faces = new int[count * 4];
@@ -982,7 +981,119 @@ namespace Malloc.NomadLink
                 }
             }
 
-            return TriangulateFaces(faces, vertexCount);
+            return faces;
+        }
+
+        private static MeshData ReadMeshData(
+            string json, byte[] binary, Vector3[] positions, int[] faces)
+        {
+            var sourceTriangles = TriangulateFaces(faces, positions.Length);
+            var uvHeader = ReadUvHeader(json);
+            if (uvHeader == null)
+            {
+                return new MeshData(positions, sourceTriangles, sourceTriangles,
+                    Enumerable.Range(0, positions.Length).ToArray(), Array.Empty<Vector2>());
+            }
+
+            var coordinates = ReadUvs(binary, uvHeader, faces.Length);
+            return SplitUvVertices(binary, uvHeader.face_uv_offset,
+                positions, faces, sourceTriangles, coordinates);
+        }
+
+        private static UvDto ReadUvHeader(string json)
+        {
+            var first = new UvDto();
+            var second = new UvDto
+            {
+                texcoord_count = -1, texcoord_offset = -1,
+                face_uv_offset = -1, texcoord_format = "absent"
+            };
+            JsonUtility.FromJsonOverwrite(json, first);
+            JsonUtility.FromJsonOverwrite(json, second);
+            var present = new[]
+            {
+                first.texcoord_count == second.texcoord_count,
+                first.texcoord_offset == second.texcoord_offset,
+                first.face_uv_offset == second.face_uv_offset,
+                first.texcoord_format == second.texcoord_format
+            };
+            if (!present.Any(value => value))
+            {
+                return null;
+            }
+
+            if (!present.All(value => value))
+            {
+                throw new InvalidDataException("The UV field group is incomplete.");
+            }
+
+            return first;
+        }
+
+        private static Vector2[] ReadUvs(byte[] binary, UvDto header, int cornerCount)
+        {
+            if (header.texcoord_count < 0 || header.texcoord_offset < 0 ||
+                header.face_uv_offset < 0 || header.texcoord_format != "float32x2")
+            {
+                throw new InvalidDataException("The UV field group is incomplete or unsupported.");
+            }
+
+            ValidateRange(header.texcoord_offset, header.texcoord_count, 8, binary.Length);
+            ValidateRange(header.face_uv_offset, cornerCount, 4, binary.Length);
+            var coordinates = new Vector2[header.texcoord_count];
+            for (var index = 0; index < coordinates.Length; index++)
+            {
+                var offset = checked((int)(header.texcoord_offset + index * 8L));
+                var u = ReadSingle(binary, offset);
+                var v = ReadSingle(binary, offset + 4);
+                if (!IsFinite(u) || !IsFinite(v))
+                {
+                    throw new InvalidDataException("A UV coordinate is not finite.");
+                }
+
+                coordinates[index] = new Vector2(u, 1f - v);
+            }
+
+            return coordinates;
+        }
+
+        private static MeshData SplitUvVertices(
+            byte[] binary, long uvOffset, Vector3[] positions, int[] faces,
+            int[] sourceTriangles, Vector2[] coordinates)
+        {
+            var pairs = new Dictionary<(int, int), int>();
+            var sources = new List<int>();
+            var uvs = new List<Vector2>();
+            var splitFaces = new int[faces.Length];
+            for (var corner = 0; corner < faces.Length; corner++)
+            {
+                if (faces[corner] == -1)
+                {
+                    splitFaces[corner] = -1;
+                    continue;
+                }
+
+                var uvIndex = BinaryPrimitives.ReadInt32LittleEndian(
+                    binary.AsSpan(checked((int)(uvOffset + corner * 4L)), 4));
+                if (uvIndex < 0 || uvIndex >= coordinates.Length)
+                {
+                    throw new InvalidDataException("A face UV index is invalid.");
+                }
+
+                var key = (faces[corner], uvIndex);
+                if (!pairs.TryGetValue(key, out var output))
+                {
+                    output = sources.Count;
+                    pairs.Add(key, output);
+                    sources.Add(faces[corner]);
+                    uvs.Add(coordinates[uvIndex]);
+                }
+
+                splitFaces[corner] = output;
+            }
+
+            return new MeshData(positions, sourceTriangles,
+                TriangulateFaces(splitFaces, sources.Count), sources.ToArray(), uvs.ToArray());
         }
 
         internal static int[] TriangulateFaces(
@@ -1091,16 +1202,43 @@ namespace Malloc.NomadLink
             return new DeltaData(indices, positions);
         }
 
-        private static void ApplyPositionDelta(
-            Mesh mesh,
-            int[] indices,
-            Vector3[] positions)
+        private static void UpdateMeshPositions(Mesh mesh, MeshData data)
         {
-            var vertices = mesh.vertices;
-            ApplyPositionDelta(vertices, indices, positions);
+            var vertices = new Vector3[data.Sources.Length];
+            var normals = new Vector3[data.Sources.Length];
+            var sourceNormals = CalculateSourceNormals(data);
+            for (var index = 0; index < vertices.Length; index++)
+            {
+                vertices[index] = data.Positions[data.Sources[index]];
+                normals[index] = sourceNormals[data.Sources[index]];
+            }
+
             mesh.vertices = vertices;
+            mesh.normals = normals;
             mesh.RecalculateBounds();
-            mesh.RecalculateNormals();
+        }
+
+        private static Vector3[] CalculateSourceNormals(MeshData data)
+        {
+            var normals = new Vector3[data.Positions.Length];
+            for (var index = 0; index < data.SourceTriangles.Length; index += 3)
+            {
+                var a = data.SourceTriangles[index];
+                var b = data.SourceTriangles[index + 1];
+                var c = data.SourceTriangles[index + 2];
+                var normal = Vector3.Cross(data.Positions[b] - data.Positions[a],
+                    data.Positions[c] - data.Positions[a]);
+                normals[a] += normal;
+                normals[b] += normal;
+                normals[c] += normal;
+            }
+
+            for (var index = 0; index < normals.Length; index++)
+            {
+                normals[index] = normals[index].normalized;
+            }
+
+            return normals;
         }
 
         internal static void ApplyPositionDelta(
@@ -1127,19 +1265,15 @@ namespace Malloc.NomadLink
             }
         }
 
-        private static void WriteMesh(
-            Mesh mesh,
-            Vector3[] vertices,
-            int[] triangles)
+        private static void WriteMesh(Mesh mesh, MeshData data)
         {
             mesh.Clear();
-            mesh.indexFormat = ShouldUseUInt32(vertices.Length)
+            mesh.indexFormat = ShouldUseUInt32(data.Sources.Length)
                 ? IndexFormat.UInt32
                 : IndexFormat.UInt16;
-            mesh.vertices = vertices;
-            mesh.triangles = triangles;
-            mesh.RecalculateBounds();
-            mesh.RecalculateNormals();
+            UpdateMeshPositions(mesh, data);
+            mesh.triangles = data.Triangles;
+            mesh.uv = data.Uvs;
         }
 
         internal static bool ShouldUseUInt32(int vertexCount)
@@ -1148,18 +1282,20 @@ namespace Malloc.NomadLink
         }
 
         private static void ValidateTopologyReplacement(
-            Mesh mesh,
+            MeshData current,
             bool replaceTopology,
-            int vertexCount,
-            int[] triangles)
+            MeshData next)
         {
-            if (mesh.vertexCount == 0 || replaceTopology)
+            if (current == null || replaceTopology)
             {
                 return;
             }
 
-            if (mesh.vertexCount != vertexCount ||
-                !mesh.triangles.SequenceEqual(triangles))
+            if (current.Positions.Length != next.Positions.Length ||
+                !current.SourceTriangles.SequenceEqual(next.SourceTriangles) ||
+                !current.Sources.SequenceEqual(next.Sources) ||
+                !current.Triangles.SequenceEqual(next.Triangles) ||
+                !current.Uvs.SequenceEqual(next.Uvs))
             {
                 throw new InvalidDataException(
                     "The full mesh cannot replace topology.");
@@ -1976,7 +2112,27 @@ namespace Malloc.NomadLink
 
             internal string GeometryId { get; }
             internal Mesh Mesh { get; }
+            internal MeshData Data { get; set; }
             internal int ReferenceCount { get; set; }
+        }
+
+        private sealed class MeshData
+        {
+            internal MeshData(Vector3[] positions, int[] sourceTriangles,
+                int[] triangles, int[] sources, Vector2[] uvs)
+            {
+                Positions = positions;
+                SourceTriangles = sourceTriangles;
+                Triangles = triangles;
+                Sources = sources;
+                Uvs = uvs;
+            }
+
+            internal Vector3[] Positions { get; }
+            internal int[] SourceTriangles { get; }
+            internal int[] Triangles { get; }
+            internal int[] Sources { get; }
+            internal Vector2[] Uvs { get; }
         }
 
         private readonly struct DeltaData
@@ -2168,6 +2324,15 @@ namespace Malloc.NomadLink
             public string face_format;
             public bool replace_topology;
             public string request_id;
+        }
+
+        [Serializable]
+        private sealed class UvDto
+        {
+            public int texcoord_count;
+            public long texcoord_offset;
+            public string texcoord_format;
+            public long face_uv_offset;
         }
 
         [Serializable]
