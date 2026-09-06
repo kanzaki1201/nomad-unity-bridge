@@ -43,6 +43,7 @@ https://github.com/kanzaki1201/nomad-unity-bridge.git
 - Preview objects and Unity material assignments are session-only and are not persistent.
 - Only meshes are supported.
 - Vertex colors are not supported.
+- MToon materials can appear excessively bright at close range on synced meshes; see the [known issue](https://github.com/kanzaki1201/nomad-unity-bridge/issues/1).
 - One scene can own the active sync session at a time, in Edit mode only.
 - Unity changes are not sent to Nomad.
 - The bridge receives geometry and object state; assign shading in Unity.
