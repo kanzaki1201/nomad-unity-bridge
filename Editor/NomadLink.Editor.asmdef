@@ -1,0 +1,11 @@
+{
+  "name": "NomadLink.Editor",
+  "rootNamespace": "Malloc.NomadLink",
+  "references": [
+    "NomadLink.Runtime"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

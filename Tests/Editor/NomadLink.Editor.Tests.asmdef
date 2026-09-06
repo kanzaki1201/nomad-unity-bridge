@@ -1,0 +1,15 @@
+{
+  "name": "NomadLink.Editor.Tests",
+  "rootNamespace": "Malloc.NomadLink.Tests",
+  "references": [
+    "NomadLink.Runtime",
+    "NomadLink.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
+  "autoReferenced": false
+}
