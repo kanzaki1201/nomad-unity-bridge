@@ -1,4 +1,4 @@
-# Nomad Unity Bridge
+# Nomad Sculpt Unity Bridge (One Way)
 
 Live, one-way scene preview from Nomad to the Unity Editor through [Nomad App Linking](https://github.com/stephomi/nomad-link).
 Sync multiple objects and assign Unity materials for previz.
@@ -47,4 +47,5 @@ https://github.com/kanzaki1201/nomad-unity-bridge.git
 
 ## Upstream
 
-This bridge implements the App Linking protocol from [stephomi/nomad-link](https://github.com/stephomi/nomad-link).
+Based on Nomad Link 0.11.43, protocol version 1
+([source commit](https://github.com/stephomi/nomad-link/tree/f55dc803dd3224e0cd2e65cfe32633813114111d)).
