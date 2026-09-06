@@ -622,6 +622,11 @@ namespace Malloc.NomadLink
             ValidateGeometryUsers(entry.GeometryId);
             ApplyPositionDelta(geometry.Data.Positions, delta.Indices, delta.Positions);
             UpdateMeshPositions(geometry.Mesh, geometry.Data);
+            if (geometry.Data.Uvs.Length > 0)
+            {
+                geometry.Mesh.RecalculateTangents();
+            }
+
             ApplyIncomingState(entry, json, header.request_id);
         }
 
@@ -1267,13 +1272,17 @@ namespace Malloc.NomadLink
 
         private static void WriteMesh(Mesh mesh, MeshData data)
         {
-            mesh.Clear();
+            mesh.Clear(false);
             mesh.indexFormat = ShouldUseUInt32(data.Sources.Length)
                 ? IndexFormat.UInt32
                 : IndexFormat.UInt16;
             UpdateMeshPositions(mesh, data);
             mesh.triangles = data.Triangles;
             mesh.uv = data.Uvs;
+            if (data.Uvs.Length > 0)
+            {
+                mesh.RecalculateTangents();
+            }
         }
 
         internal static bool ShouldUseUInt32(int vertexCount)

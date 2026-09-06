@@ -201,6 +201,55 @@ namespace Malloc.NomadLink.Tests
             }
         }
 
+        [Test]
+        public void TangentsFollowUvGeometryAndDisappearWithoutUvs()
+        {
+            using (var peer = new FakePeer())
+            {
+                pairPort = peer.Port;
+                CompleteHandshake(peer, false);
+                var full = MeshFullJson("mesh-a", "geometry-a", "Tangents", false, false);
+                var uvFull = full.Replace("\"binary_size\":52", "\"binary_size\":92")
+                    .TrimEnd('}') + ",\"texcoord_count\":3,\"texcoord_offset\":52," +
+                    "\"texcoord_format\":\"float32x2\",\"face_uv_offset\":76}";
+                var binary = new byte[92];
+                MeshBinary(1f).CopyTo(binary, 0);
+                WriteSingle(binary, 60, 1f);
+                WriteSingle(binary, 72, 1f);
+                BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(80, 4), 1);
+                BinaryPrimitives.WriteInt32LittleEndian(binary.AsSpan(84, 4), 2);
+                peer.Send(uvFull, binary);
+                WaitUntil(() => session.ObjectCount == 1);
+                var mesh = session.FindMesh("mesh-a");
+                AssertTangents(mesh, Vector3.right);
+                var delta = DeltaBinary(1f);
+                WriteVector(delta, 4, 1f, 0f, 1f);
+                peer.Send(MeshDeltaJson("mesh-a", true), delta);
+                WaitUntil(() => mesh.vertices[1].z == -1f);
+                AssertTangents(mesh, new Vector3(1f, 0f, -1f).normalized);
+                peer.Send(uvFull, binary);
+                WaitUntil(() => mesh.vertices[1].z == 0f);
+                AssertTangents(mesh, Vector3.right);
+                peer.Send(full, MeshBinary(1f));
+                WaitUntil(() => mesh.uv.Length == 0);
+                Assert.That(mesh.HasVertexAttribute(UnityEngine.Rendering.VertexAttribute.Tangent), Is.False);
+                peer.Send(MeshDeltaJson("mesh-a", true), DeltaBinary(2f));
+                WaitUntil(() => mesh.vertices[1].x == 2f);
+                Assert.That(mesh.HasVertexAttribute(UnityEngine.Rendering.VertexAttribute.Tangent), Is.False);
+            }
+        }
+
+        private static void AssertTangents(Mesh mesh, Vector3 expected)
+        {
+            var tangents = mesh.tangents;
+            Assert.That(tangents.Length, Is.EqualTo(mesh.vertexCount));
+            foreach (var tangent in tangents)
+            {
+                Assert.That(Vector3.Distance((Vector3)tangent, expected), Is.LessThan(0.0001f));
+                Assert.That(tangent.w, Is.EqualTo(1f));
+            }
+        }
+
         private static string UvMeshJson()
         {
             return MeshFullJson("mesh-a", "geometry-a", "UV", false, false)
