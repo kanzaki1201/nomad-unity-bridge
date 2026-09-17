@@ -38,7 +38,8 @@ namespace Malloc.NomadLink
             "object_state",
             "session_config",
             "mesh_instance",
-            "mesh_delta_receive"
+            "mesh_delta_receive",
+            "mesh_attributes_receive"
         };
 
         private readonly ConcurrentQueue<WorkerItem> incoming =
@@ -379,6 +380,9 @@ namespace Malloc.NomadLink
                 case "mesh_delta":
                     HandleMeshDelta(json, binary);
                     break;
+                case "mesh_attributes":
+                    HandleMeshAttributes(json, binary);
+                    break;
                 case "mesh_instance":
                     RequireJsonOnly(binary);
                     HandleMeshInstance(json);
@@ -525,16 +529,26 @@ namespace Malloc.NomadLink
             ValidateMeshFullHeader(json, header);
             var vertices = ReadVertices(
                 binary, header.position_offset, header.vertex_count);
-            var triangles = ReadFaces(
-                binary, header.face_offset, header.face_count,
-                header.vertex_count);
+            var faces = ReadFaces(
+                binary, header.face_offset, header.face_count);
+            var data = ReadMeshData(json, binary, vertices, faces);
 
             if (!CanApplyLiveFrame(json))
             {
                 return;
             }
 
-            ApplyMeshFull(header, json, vertices, triangles);
+            try
+            {
+                data.Colors = ReadPaint(json, binary, vertices.Length, null, null);
+            }
+            catch (Exception exception) when (IsInvalidUpdate(exception))
+            {
+                SetStatus("Connected. Skipped paint: " + exception.Message);
+                return;
+            }
+
+            ApplyMeshFull(header, json, data);
             Send(new MeshAckDto
             {
                 type = "mesh_ack",
@@ -546,14 +560,13 @@ namespace Malloc.NomadLink
         private void ApplyMeshFull(
             MeshFullDto header,
             string json,
-            Vector3[] vertices,
-            int[] triangles)
+            MeshData data)
         {
             var geometry = GetOrCreateGeometry(header.geometry_id);
             ValidateTopologyReplacement(
-                geometry.Mesh, header.replace_topology,
-                vertices.Length, triangles);
-            WriteMesh(geometry.Mesh, vertices, triangles);
+                geometry.Data, header.replace_topology, data);
+            WriteMesh(geometry.Mesh, data);
+            geometry.Data = data;
 
             var entry = GetOrCreateObject(header.mesh_id);
             AttachGeometry(entry, geometry);
@@ -592,28 +605,82 @@ namespace Malloc.NomadLink
         private void HandleMeshDelta(string json, byte[] binary)
         {
             RequireHello();
-            var header = JsonUtility.FromJson<MeshDeltaDto>(json);
-            ValidateMeshDeltaHeader(header);
             if (!CanApplyLiveFrame(json))
             {
                 return;
             }
 
-            if (!objects.TryGetValue(header.mesh_id, out var entry))
+            try
             {
-                Send(new RequestMeshDto
-                {
-                    type = "request_mesh",
-                    link_id = header.mesh_id
-                });
-                return;
+                ApplyMeshDelta(json, binary);
+            }
+            catch (Exception exception) when (IsInvalidUpdate(exception))
+            {
+                SetStatus("Connected. Skipped mesh delta: " + exception.Message);
+            }
+        }
+
+        private void ApplyMeshDelta(string json, byte[] binary)
+        {
+            var header = ReadUpdateHeader(json, true);
+            if (header.index_format != "uint32")
+            {
+                throw new InvalidDataException("The delta index format is unsupported.");
             }
 
+            if (!TryGetUpdateObject(header.mesh_id, out var entry)) return;
             var geometry = GetGeometry(entry);
-            var delta = ReadDelta(binary, header, geometry.Mesh.vertexCount);
+            var channels = ReadChannels(json);
+            var delta = ReadDelta(binary, header, geometry.Data.Positions.Length,
+                channels.HasPosition);
+            var colors = ReadPaint(json, binary, header.vertex_count,
+                geometry.Data.Colors, delta.Indices);
             ValidateGeometryUsers(entry.GeometryId);
-            ApplyPositionDelta(geometry.Mesh, delta.Indices, delta.Positions);
+            if (channels.HasPosition)
+            {
+                ApplyPositionDelta(geometry.Data.Positions, delta.Indices, delta.Positions);
+                UpdateMeshPositions(geometry.Mesh, geometry.Data);
+                if (geometry.Data.Uvs.Length > 0) geometry.Mesh.RecalculateTangents();
+            }
+
+            geometry.Data.Colors = colors;
+            if (channels.HasColor || channels.HasOpacity) WriteColors(geometry.Mesh, geometry.Data);
             ApplyIncomingState(entry, json, header.request_id);
+        }
+
+        private void HandleMeshAttributes(string json, byte[] binary)
+        {
+            RequireHello();
+            if (!CanApplyLiveFrame(json)) return;
+            try
+            {
+                var header = ReadUpdateHeader(json, false);
+                if (!TryGetUpdateObject(header.mesh_id, out var entry)) return;
+                var geometry = GetGeometry(entry);
+                if (header.vertex_count != geometry.Data.Positions.Length)
+                    throw new InvalidDataException("The paint topology does not match.");
+                var colors = ReadPaint(json, binary, header.vertex_count,
+                    geometry.Data.Colors, null);
+                ValidateGeometryUsers(entry.GeometryId);
+                geometry.Data.Colors = colors;
+                WriteColors(geometry.Mesh, geometry.Data);
+            }
+            catch (Exception exception) when (IsInvalidUpdate(exception))
+            {
+                SetStatus("Connected. Skipped mesh attributes: " + exception.Message);
+            }
+        }
+
+        private bool TryGetUpdateObject(string meshId, out ObjectEntry entry)
+        {
+            if (objects.TryGetValue(meshId, out entry)) return true;
+            Send(new RequestMeshDto { type = "request_mesh", link_id = meshId });
+            return false;
+        }
+
+        private static bool IsInvalidUpdate(Exception exception)
+        {
+            return exception is InvalidDataException || exception is OverflowException;
         }
 
         private void HandleObjectState(string json)
@@ -921,18 +988,24 @@ namespace Malloc.NomadLink
         private static void ValidateMeshDeltaHeader(MeshDeltaDto header)
         {
             if (header == null || string.IsNullOrEmpty(header.mesh_id) ||
-                header.count < 0 || header.vertex_count < 0 ||
-                header.index_format != "uint32")
+                header.count < 0 || header.vertex_count < 0)
             {
                 throw new InvalidDataException(
                     "The mesh delta header is invalid.");
             }
+        }
 
-            if (header.position_format != "float32x3")
-            {
-                throw new InvalidDataException(
-                    "The mesh delta format is unsupported.");
-            }
+        private static MeshDeltaDto ReadUpdateHeader(string json, bool sparse)
+        {
+            var header = new MeshDeltaDto();
+            var alternate = new MeshDeltaDto { count = -1, vertex_count = -1, index_offset = -1 };
+            JsonUtility.FromJsonOverwrite(json, header);
+            JsonUtility.FromJsonOverwrite(json, alternate);
+            ValidateMeshDeltaHeader(header);
+            if (header.vertex_count != alternate.vertex_count ||
+                (sparse && (header.count != alternate.count || header.index_offset != alternate.index_offset)))
+                throw new InvalidDataException("The mesh update header is incomplete.");
+            return header;
         }
 
         private static Vector3[] ReadVertices(
@@ -964,8 +1037,7 @@ namespace Malloc.NomadLink
         private static int[] ReadFaces(
             byte[] binary,
             long offset,
-            int count,
-            int vertexCount)
+            int count)
         {
             ValidateRange(offset, count, 16, binary.Length);
             var faces = new int[count * 4];
@@ -980,7 +1052,119 @@ namespace Malloc.NomadLink
                 }
             }
 
-            return TriangulateFaces(faces, vertexCount);
+            return faces;
+        }
+
+        private static MeshData ReadMeshData(
+            string json, byte[] binary, Vector3[] positions, int[] faces)
+        {
+            var sourceTriangles = TriangulateFaces(faces, positions.Length);
+            var uvHeader = ReadUvHeader(json);
+            if (uvHeader == null)
+            {
+                return new MeshData(positions, sourceTriangles, sourceTriangles,
+                    Enumerable.Range(0, positions.Length).ToArray(), Array.Empty<Vector2>());
+            }
+
+            var coordinates = ReadUvs(binary, uvHeader, faces.Length);
+            return SplitUvVertices(binary, uvHeader.face_uv_offset,
+                positions, faces, sourceTriangles, coordinates);
+        }
+
+        private static UvDto ReadUvHeader(string json)
+        {
+            var first = new UvDto();
+            var second = new UvDto
+            {
+                texcoord_count = -1, texcoord_offset = -1,
+                face_uv_offset = -1, texcoord_format = "absent"
+            };
+            JsonUtility.FromJsonOverwrite(json, first);
+            JsonUtility.FromJsonOverwrite(json, second);
+            var present = new[]
+            {
+                first.texcoord_count == second.texcoord_count,
+                first.texcoord_offset == second.texcoord_offset,
+                first.face_uv_offset == second.face_uv_offset,
+                first.texcoord_format == second.texcoord_format
+            };
+            if (!present.Any(value => value))
+            {
+                return null;
+            }
+
+            if (!present.All(value => value))
+            {
+                throw new InvalidDataException("The UV field group is incomplete.");
+            }
+
+            return first;
+        }
+
+        private static Vector2[] ReadUvs(byte[] binary, UvDto header, int cornerCount)
+        {
+            if (header.texcoord_count < 0 || header.texcoord_offset < 0 ||
+                header.face_uv_offset < 0 || header.texcoord_format != "float32x2")
+            {
+                throw new InvalidDataException("The UV field group is incomplete or unsupported.");
+            }
+
+            ValidateRange(header.texcoord_offset, header.texcoord_count, 8, binary.Length);
+            ValidateRange(header.face_uv_offset, cornerCount, 4, binary.Length);
+            var coordinates = new Vector2[header.texcoord_count];
+            for (var index = 0; index < coordinates.Length; index++)
+            {
+                var offset = checked((int)(header.texcoord_offset + index * 8L));
+                var u = ReadSingle(binary, offset);
+                var v = ReadSingle(binary, offset + 4);
+                if (!IsFinite(u) || !IsFinite(v))
+                {
+                    throw new InvalidDataException("A UV coordinate is not finite.");
+                }
+
+                coordinates[index] = new Vector2(u, 1f - v);
+            }
+
+            return coordinates;
+        }
+
+        private static MeshData SplitUvVertices(
+            byte[] binary, long uvOffset, Vector3[] positions, int[] faces,
+            int[] sourceTriangles, Vector2[] coordinates)
+        {
+            var pairs = new Dictionary<(int, int), int>();
+            var sources = new List<int>();
+            var uvs = new List<Vector2>();
+            var splitFaces = new int[faces.Length];
+            for (var corner = 0; corner < faces.Length; corner++)
+            {
+                if (faces[corner] == -1)
+                {
+                    splitFaces[corner] = -1;
+                    continue;
+                }
+
+                var uvIndex = BinaryPrimitives.ReadInt32LittleEndian(
+                    binary.AsSpan(checked((int)(uvOffset + corner * 4L)), 4));
+                if (uvIndex < 0 || uvIndex >= coordinates.Length)
+                {
+                    throw new InvalidDataException("A face UV index is invalid.");
+                }
+
+                var key = (faces[corner], uvIndex);
+                if (!pairs.TryGetValue(key, out var output))
+                {
+                    output = sources.Count;
+                    pairs.Add(key, output);
+                    sources.Add(faces[corner]);
+                    uvs.Add(coordinates[uvIndex]);
+                }
+
+                splitFaces[corner] = output;
+            }
+
+            return new MeshData(positions, sourceTriangles,
+                TriangulateFaces(splitFaces, sources.Count), sources.ToArray(), uvs.ToArray());
         }
 
         internal static int[] TriangulateFaces(
@@ -1048,7 +1232,8 @@ namespace Malloc.NomadLink
         private static DeltaData ReadDelta(
             byte[] binary,
             MeshDeltaDto header,
-            int currentVertexCount)
+            int currentVertexCount,
+            bool hasPositions)
         {
             if (header.vertex_count != currentVertexCount)
             {
@@ -1057,9 +1242,10 @@ namespace Malloc.NomadLink
             }
 
             ValidateRange(header.index_offset, header.count, 4, binary.Length);
-            ValidateRange(header.position_offset, header.count, 12, binary.Length);
             var indices = new int[header.count];
-            var positions = new Vector3[header.count];
+            var positions = hasPositions
+                ? ReadVertices(binary, header.position_offset, header.count)
+                : Array.Empty<Vector3>();
             for (var item = 0; item < header.count; item++)
             {
                 var indexPosition = checked((int)(
@@ -1073,32 +1259,112 @@ namespace Malloc.NomadLink
                 }
 
                 indices[item] = (int)vertexIndex;
-                var position = checked((int)(
-                    header.position_offset + item * 12L));
-                positions[item] = new Vector3(
-                    ReadSingle(binary, position),
-                    ReadSingle(binary, position + 4),
-                    -ReadSingle(binary, position + 8));
-                if (!IsFinite(positions[item]))
-                {
-                    throw new InvalidDataException(
-                        "A mesh delta position is not finite.");
-                }
             }
 
             return new DeltaData(indices, positions);
         }
 
-        private static void ApplyPositionDelta(
-            Mesh mesh,
-            int[] indices,
-            Vector3[] positions)
+        private static ChannelsDto ReadChannels(string json)
         {
-            var vertices = mesh.vertices;
-            ApplyPositionDelta(vertices, indices, positions);
+            var first = new ChannelsDto();
+            var second = new ChannelsDto
+            {
+                position_offset = -1, color_offset = -1, opacity_offset = -1,
+                position_format = "absent", color_format = "absent", opacity_format = "absent"
+            };
+            JsonUtility.FromJsonOverwrite(json, first);
+            JsonUtility.FromJsonOverwrite(json, second);
+            first.HasPosition = ValidateChannel(first.position_offset == second.position_offset,
+                first.position_format == second.position_format, first.position_format, "float32x3");
+            first.HasColor = ValidateChannel(first.color_offset == second.color_offset,
+                first.color_format == second.color_format, first.color_format, "rgbm8");
+            first.HasOpacity = ValidateChannel(first.opacity_offset == second.opacity_offset,
+                first.opacity_format == second.opacity_format, first.opacity_format, "uint8_norm");
+            return first;
+        }
+
+        private static bool ValidateChannel(bool offsetPresent, bool formatPresent,
+            string format, string supported)
+        {
+            if (offsetPresent != formatPresent || (formatPresent && format != supported))
+                throw new InvalidDataException("A channel is incomplete or its format is unsupported.");
+            return offsetPresent;
+        }
+
+        private static Color[] ReadPaint(string json, byte[] binary, int vertexCount,
+            Color[] current, int[] indices)
+        {
+            var channels = ReadChannels(json);
+            if (!channels.HasColor && !channels.HasOpacity)
+                return current ?? Array.Empty<Color>();
+            var count = indices?.Length ?? vertexCount;
+            if (channels.HasColor) ValidateRange(channels.color_offset, count, 4, binary.Length);
+            if (channels.HasOpacity) ValidateRange(channels.opacity_offset, count, 1, binary.Length);
+            var colors = current != null && current.Length == vertexCount
+                ? (Color[])current.Clone()
+                : Enumerable.Repeat(Color.white, vertexCount).ToArray();
+            for (var index = 0; index < count; index++)
+            {
+                var source = indices == null ? index : indices[index];
+                var color = colors[source];
+                if (channels.HasColor)
+                {
+                    var offset = checked((int)(channels.color_offset + index * 4L));
+                    var multiplier = binary[offset + 3] / 65025f;
+                    color.r = binary[offset] * multiplier;
+                    color.g = binary[offset + 1] * multiplier;
+                    color.b = binary[offset + 2] * multiplier;
+                }
+                if (channels.HasOpacity)
+                    color.a = binary[checked((int)(channels.opacity_offset + index))] / 255f;
+                colors[source] = color;
+            }
+            return colors;
+        }
+
+        private static void WriteColors(Mesh mesh, MeshData data)
+        {
+            mesh.colors = data.Colors.Length == 0 ? Array.Empty<Color>()
+                : data.Sources.Select(source => data.Colors[source]).ToArray();
+        }
+
+        private static void UpdateMeshPositions(Mesh mesh, MeshData data)
+        {
+            var vertices = new Vector3[data.Sources.Length];
+            var normals = new Vector3[data.Sources.Length];
+            var sourceNormals = CalculateSourceNormals(data);
+            for (var index = 0; index < vertices.Length; index++)
+            {
+                vertices[index] = data.Positions[data.Sources[index]];
+                normals[index] = sourceNormals[data.Sources[index]];
+            }
+
             mesh.vertices = vertices;
+            mesh.normals = normals;
             mesh.RecalculateBounds();
-            mesh.RecalculateNormals();
+        }
+
+        private static Vector3[] CalculateSourceNormals(MeshData data)
+        {
+            var normals = new Vector3[data.Positions.Length];
+            for (var index = 0; index < data.SourceTriangles.Length; index += 3)
+            {
+                var a = data.SourceTriangles[index];
+                var b = data.SourceTriangles[index + 1];
+                var c = data.SourceTriangles[index + 2];
+                var normal = Vector3.Cross(data.Positions[b] - data.Positions[a],
+                    data.Positions[c] - data.Positions[a]);
+                normals[a] += normal;
+                normals[b] += normal;
+                normals[c] += normal;
+            }
+
+            for (var index = 0; index < normals.Length; index++)
+            {
+                normals[index] = normals[index].normalized;
+            }
+
+            return normals;
         }
 
         internal static void ApplyPositionDelta(
@@ -1125,19 +1391,20 @@ namespace Malloc.NomadLink
             }
         }
 
-        private static void WriteMesh(
-            Mesh mesh,
-            Vector3[] vertices,
-            int[] triangles)
+        private static void WriteMesh(Mesh mesh, MeshData data)
         {
-            mesh.Clear();
-            mesh.indexFormat = ShouldUseUInt32(vertices.Length)
+            mesh.Clear(false);
+            mesh.indexFormat = ShouldUseUInt32(data.Sources.Length)
                 ? IndexFormat.UInt32
                 : IndexFormat.UInt16;
-            mesh.vertices = vertices;
-            mesh.triangles = triangles;
-            mesh.RecalculateBounds();
-            mesh.RecalculateNormals();
+            UpdateMeshPositions(mesh, data);
+            mesh.triangles = data.Triangles;
+            mesh.uv = data.Uvs;
+            WriteColors(mesh, data);
+            if (data.Uvs.Length > 0)
+            {
+                mesh.RecalculateTangents();
+            }
         }
 
         internal static bool ShouldUseUInt32(int vertexCount)
@@ -1146,18 +1413,20 @@ namespace Malloc.NomadLink
         }
 
         private static void ValidateTopologyReplacement(
-            Mesh mesh,
+            MeshData current,
             bool replaceTopology,
-            int vertexCount,
-            int[] triangles)
+            MeshData next)
         {
-            if (mesh.vertexCount == 0 || replaceTopology)
+            if (current == null || replaceTopology)
             {
                 return;
             }
 
-            if (mesh.vertexCount != vertexCount ||
-                !mesh.triangles.SequenceEqual(triangles))
+            if (current.Positions.Length != next.Positions.Length ||
+                !current.SourceTriangles.SequenceEqual(next.SourceTriangles) ||
+                !current.Sources.SequenceEqual(next.Sources) ||
+                !current.Triangles.SequenceEqual(next.Triangles) ||
+                !current.Uvs.SequenceEqual(next.Uvs))
             {
                 throw new InvalidDataException(
                     "The full mesh cannot replace topology.");
@@ -1974,7 +2243,28 @@ namespace Malloc.NomadLink
 
             internal string GeometryId { get; }
             internal Mesh Mesh { get; }
+            internal MeshData Data { get; set; }
             internal int ReferenceCount { get; set; }
+        }
+
+        private sealed class MeshData
+        {
+            internal MeshData(Vector3[] positions, int[] sourceTriangles,
+                int[] triangles, int[] sources, Vector2[] uvs)
+            {
+                Positions = positions;
+                SourceTriangles = sourceTriangles;
+                Triangles = triangles;
+                Sources = sources;
+                Uvs = uvs;
+            }
+
+            internal Vector3[] Positions { get; }
+            internal int[] SourceTriangles { get; }
+            internal int[] Triangles { get; }
+            internal int[] Sources { get; }
+            internal Vector2[] Uvs { get; }
+            internal Color[] Colors { get; set; } = Array.Empty<Color>();
         }
 
         private readonly struct DeltaData
@@ -2166,6 +2456,29 @@ namespace Malloc.NomadLink
             public string face_format;
             public bool replace_topology;
             public string request_id;
+        }
+
+        [Serializable]
+        private sealed class UvDto
+        {
+            public int texcoord_count;
+            public long texcoord_offset;
+            public string texcoord_format;
+            public long face_uv_offset;
+        }
+
+        [Serializable]
+        private sealed class ChannelsDto
+        {
+            public long position_offset;
+            public string position_format;
+            public long color_offset;
+            public string color_format;
+            public long opacity_offset;
+            public string opacity_format;
+            internal bool HasPosition;
+            internal bool HasColor;
+            internal bool HasOpacity;
         }
 
         [Serializable]

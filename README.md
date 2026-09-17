@@ -1,7 +1,9 @@
-# Nomad Unity Bridge
+# Nomad Sculpt Unity Bridge (One Way)
 
 Live, one-way scene preview from Nomad to the Unity Editor through [Nomad App Linking](https://github.com/stephomi/nomad-link).
 Sync multiple objects and assign Unity materials for previz.
+
+[Watch the Nomad Sculpt to Unity demo](Documentation~/nomad-unity-bridge.mp4).
 
 ## Requirements
 
@@ -28,23 +30,26 @@ https://github.com/kanzaki1201/nomad-unity-bridge.git
 
 ## Preview materials
 
-Each synced object has one material field.
-You can assign, replace, or clear it independently, including on objects that share geometry.
-Mesh updates, transforms, visibility changes, and renames preserve the assignment during the session.
-
-Preview objects and their material assignments last only for the active session.
-**Disable Sync**, a lost connection, scene closure, script reload, or a Play mode transition clears the preview.
-The pairing token is stored in Unity Editor preferences for the same host and port.
+- Each synced object has one material field.
+- Mesh UV coordinates are preserved for textured Unity materials.
+- You can assign, replace, or clear it independently, including on objects that share geometry.
+- Mesh updates, transforms, visibility changes, and renames preserve the assignment during the session.
+- Preview objects and their material assignments last only for the active session.
+- **Disable Sync**, a lost connection, scene closure, script reload, or a Play mode transition clears the preview.
+- The pairing token is stored in Unity Editor preferences for the same host and port.
 
 ## Limits
 
-Preview objects and Unity material assignments are session-only and are not persistent.
-Only meshes are supported.
-One scene can own the active sync session at a time, in Edit mode only.
-Unity changes are not sent to Nomad.
-The bridge receives geometry and object state; assign shading in Unity.
-For multiple materials, use separate Nomad objects.
+- Preview objects and Unity material assignments are session-only and are not persistent.
+- Only meshes are supported.
+- Vertex paint requires a Unity shader that consumes vertex colors.
+- MToon materials can appear excessively bright at close range on synced meshes; see the [known issue](https://github.com/kanzaki1201/nomad-unity-bridge/issues/1).
+- One scene can own the active sync session at a time, in Edit mode only.
+- Unity changes are not sent to Nomad.
+- The bridge receives geometry and object state; assign shading in Unity.
+- For multiple materials, use separate Nomad objects.
 
 ## Upstream
 
-This bridge implements the App Linking protocol from [stephomi/nomad-link](https://github.com/stephomi/nomad-link).
+Based on Nomad Link 0.11.43, protocol version 1
+([source commit](https://github.com/stephomi/nomad-link/tree/f55dc803dd3224e0cd2e65cfe32633813114111d)).

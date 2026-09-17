@@ -1,7 +1,7 @@
 {
   "name": "com.malloc.nomad-link",
   "version": "0.1.0",
-  "displayName": "Nomad Unity Bridge",
+  "displayName": "Nomad Sculpt Unity Bridge (One Way)",
   "description": "Receive-only Nomad App Linking scene preview for the Unity Editor.",
   "unity": "6000.3",
   "author": {
